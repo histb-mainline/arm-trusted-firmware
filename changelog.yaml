@@ -269,6 +269,9 @@ subsections:
           - title: Poplar
             scope: poplar
 
+          - title: Hi3798MV200H
+            scope: hi3798mv200h
+
       - title: Intel
         scope: intel
 

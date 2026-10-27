@@ -1,0 +1,181 @@
+Hi3798MV200H
+============
+
+Hi3798MV200H is a Hisilicon set-top-box SoC with four Arm Cortex-A53 cores, a
+GIC-400 interrupt controller and 1 GiB of DDR.  This port covers the
+``hi3798mv200h`` platform directory and has been brought up on a Skyworth
+set-top box board.
+
+::
+
+    SOC       Hisilicon Hi3798MV200H
+    CPU       Quad-core Arm Cortex-A53, ARMv8.0, no VHE, no SPE
+    GIC       GIC-400, distributor at 0xf1001000, CPU interface at 0xf1002000
+    DRAM      1 GiB, DDR3
+    CONSOLE   PL011 uart0 at 0xf8b00000, 115200 8N1
+    STORAGE   eMMC (HS400)
+    TIMER     ARM system counter at 0xf8bb0000, 24 MHz reference
+    WDT       SP805 watchdog 0 at 0xf8a2c000, clocked at 24 MHz
+
+At the start of the boot sequence the SoC runs the vendor fastboot, which is
+not modified by this port.  Fastboot only knows how to load an image over TFTP
+and jump to it in AArch32 EL3, so a small first stage switches the core to
+AArch64 and hands it to Trusted Firmware-A:
+
+::
+
+    vendor fastboot --> stage1 (AArch32) --> Trusted Firmware-A (BL31) --> Linux kernel
+
+There is no BL1, no BL2 and no FIP: the port is built with ``RESET_TO_BL31=1``
+and each image is loaded separately.  ``stage1`` lives outside this tree; what
+it must provide is fixed by the contract below.
+
+Boot Contract
+-------------
+
+``stage1`` runs in AArch32 EL3 and, before it takes the warm reset that moves
+the core to AArch64, has to leave the following state.  Everything here is
+board-measured on the reference hardware.
+
+-  The cluster reset vector ``0xf8a80034`` holds the link base of this BL31
+   image (``MV200H_BL31_BASE``, 0x02001000), and ``bl31_entrypoint`` must be
+   the first function emitted into that section -- the vector cannot be read
+   back on this part, so ``e_entry == MV200H_BL31_BASE`` in the linked image is
+   the only standing check that the two agree.
+-  ``AARCH_MODE`` (``0xf8a80030``) has bits 0..3 set, so every core of the
+   cluster comes out of reset in AArch64.  Neither SCS word reads back from
+   AArch32; reading it returns 0 even on a boot that works.
+-  Cores 1..3 are held in CRG reset (``0xf8a22050``, power-on bit ``12+n`` and
+   core bit ``8+n``).  A warm reset releases every core whose reset bits let it
+   out, and on this board core 3 is held only by its power-on reset, so leaving
+   them unheld lets it race the boot core through the payload.  BL31 releases
+   them one at a time through PSCI ``CPU_ON`` afterwards.
+-  Caches and the MMU are off and the D-cache has been cleaned and invalidated
+   while the caches were still disabled: this SoC's warm reset neither cleans
+   nor flushes the cluster caches, so a dirty line left over from a previous
+   run would shadow bytes the loader has just written to DDR.
+
+Two neighbouring duties are deliberately **not** part of this contract, because
+``cpus_init``/``el3_entrypoint_common`` already covers them on both the cold and
+the warm path: the cluster snoop bit ``CPUECTLR_EL1.SMPEN`` is set by
+``cortex_a53_reset_func``, which ``call_reset_handler`` reaches before
+``el3_arch_init_common`` enables the instruction cache and long before
+``bl31_plat_enable_mmu()`` enables the data cache; and the system counter is
+enabled in ``bl31_platform_setup()`` (see Notes).  An earlier revision of the
+out-of-tree stage wrote SMPEN itself with the AArch32 encodings -- that was
+measured against a first chain that ran no BL31 at all, so it is not a
+requirement of this one.
+
+How to build
+------------
+
+-  Build the BL31 image::
+
+       make PLAT=hi3798mv200h RESET_TO_BL31=1 CROSS_COMPILE=aarch64-linux-gnu- bl31
+
+   The result is ``build/hi3798mv200h/release/bl31.bin``.
+
+-  The image must fit ``MV200H_BL31_SIZE`` (80 KiB): the kernel device tree
+   reserves that window as ``bl31@2001000`` with ``no-map``, because BL31 stays
+   resident at EL3 and its data, bss and stacks live in those pages for the
+   whole run.
+
+Running on the board
+--------------------
+
+Four downloads, all through the vendor fastboot's TFTP client, then a jump to
+the first stage.  The kernel and DTB addresses are the ones BL31 hands to
+``el3_exit`` (``MV200H_BL33_BASE`` and ``MV200H_DTB_BASE``); the kernel Image
+carries its own rootfs, so there is no initrd download.
+
+::
+
+    tftp 0x02000000 stage1-with-dtb.bin   # stage1 at +0, DTB at +0x16000
+    tftp 0x02001000 bl31.bin
+    tftp 0x08000000 Image
+    go 0x02000000
+
+BL31 enters the kernel at EL2 with a masked ``DAIF`` and the DTB address in
+``x0``, the state ``Documentation/arm64/booting.rst`` asks for.  Entering at EL2
+matters on this part: the kernel's ``arch_timer`` then selects the non-secure
+physical PPI (INTID 30) that the DTB describes, where an EL1 entry would pick
+the virtual timer (INTID 27) whose comparator nothing owns.
+
+Notes
+-----
+
+-  PSCI is provided by BL31 with ``CPU_ON``, ``CPU_OFF`` and ``SYSTEM_RESET``;
+   suspend and migration are deliberately not implemented.  ``CPU_OFF`` is
+   advertised because the generic power-down path is complete here, and the
+   platform off hook only asserts: the core is powered down by the generic
+   ``cortex_a53_core_pwr_dwn()``, and the platform puts it back into CRG reset on
+   the next ``CPU_ON``.  ``CPU_ON`` rewrites ``AARCH_MODE`` and the cluster reset
+   vector on every call and clears the core's power-on reset before its core
+   reset, which is the order the vendor firmware uses.
+-  ``MAX_XLAT_TABLES`` is one larger than the mapping list consumes, and that is
+   an erratum workaround, not headroom.  With four tables the last page of the
+   block ends up as the non-cacheable coherent region (``psci_locks``), and on
+   this part ``CPU_OFF`` then does not complete: the affinity state stays
+   ``ON``, so the following ``CPU_ON`` is refused as already-on (Linux shows it
+   as ``CPU3 may not have shut down cleanly`` and ``failed to boot CPU3``).
+   Verified on a Hi3798MV200H set-top box, both directions: holding the address
+   at that page and changing only its memory type from ``MT_DEVICE`` to
+   ``MT_NON_CACHEABLE`` changes nothing, while moving the coherent region one
+   page later (which is what the fifth table does, since it is placed before it)
+   makes every hotplug cycle pass.  The stack and per-CPU regions keep the same
+   addresses in both builds, the CPU_OFF path is instruction-for-instruction
+   identical, and the EL3 page-table entries read back from RAM are as the
+   generic code intends, so the cause is below the translation tables and is
+   not a platform-side omission.
+-  BL31 does not program the GIC distributor.  The kernel's
+   ``gic_dist_init()`` never writes ``GICD_IGROUPR``, so a Group bit set from
+   EL3 is something the payload cannot undo, and every round in which EL3
+   programmed the distributor here ended with no interrupt reaching the kernel.
+   The vendor's own build of the ATF for this chip likewise leaves GIC
+   initialisation in the TEE branch that ``DISABLE_TEE=1`` excludes.  Only the
+   driver registration stays, because the ``plat_ic_*`` helpers need the
+   registered bases.
+-  BL31 enables the SoC system counter itself, in ``bl31_platform_setup()``
+   before the delay timer is initialised: ``CNTCR = 0x103`` (``CNTCR_EN |
+   CNTCR_HDBG | CNTCR_FCREQ(1)``) at 0xf8bb0000.  The frequency field of that
+   block is deliberately not programmed.  With ``CNTCR.EN`` set the block does
+   not take a write to ``CNTFID0``: after a boot in which BL31 wrote
+   ``24000000``, the field still read back ``1`` while ``CNTCR``, written by the
+   same function in the same block, read back the value written.  The in-tree
+   code that does change this field clears ``CNTCR.EN`` around the write
+   (``stm32mp_stgen_config()`` in ``drivers/st/clk/stm32mp_clkfunc.c``).  Nothing
+   in this chain consumes the field either: ``psci_arch_setup()`` programs
+   ``CNTFRQ_EL0`` from ``SYS_COUNTER_FREQ_IN_TICKS``, which is the frequency the
+   kernel's ``arch_timer`` is told, and the block's own rate is the 24 MHz
+   reference -- the count at 0xf8bb0008 was measured advancing at 24.07 MHz over
+   a 15.8 s window at the bootloader prompt.  For the record, the vendor tree
+   writes that control word and a ``1`` in the frequency field only behind build
+   guards (fastboot ``common/cmd_bootm.c`` for the FPGA and hi3796mv2x
+   configurations, and a ``resume_entry_32bit/main.c`` block inside ``#if 0``),
+   and poplar, the merged platform of this family, does not touch the block at
+   all.
+
+   The bits beyond ``CNTCR_EN`` are load-bearing on this part, and that is
+   measured rather than inherited: writing the value the Arm reference platforms
+   use (``CNTCR_FCREQ(0) | CNTCR_EN``, i.e. ``0x1``, from
+   ``plat/arm/common/arm_bl31_setup.c``) leaves this board's kernel stuck at
+   ``smp: Bringing up secondary CPUs ...`` with the secondaries never coming up
+   and nothing on the board recovering it, while every round with ``0x103``
+   reports ``Brought up 1 node, 4 CPUs`` with a tick counted on each core.  It
+   is not known which of the two extra bits carries that, and each answer costs
+   a board round that can wedge the board the same way.
+-  BL31 does not arm a boot-alive watchdog.  The only net before Linux exists is
+   the one the out-of-tree first stage programs (an SP805 load of ~170 s per
+   expiry at this part's 24 MHz counting clock, reset on the second one), and
+   the kernel's ``sp805_wdt`` probe takes that block over -- board-verified:
+   ``/sys/class/watchdog/watchdog0`` appears, and a boot with no BL31 arming was
+   still alive and answering at ``/proc/uptime`` 279 s, well past the first
+   expiry.  Arming it again from EL3 would be a bench convenience, not something
+   the platform needs, so the PSCI code only touches the block where it is the
+   mechanism: ``SYSTEM_RESET`` above and the stop before ``panic()``.
+-  ``SYSTEM_RESET`` is carried out by SP805 watchdog 0: the kernel's reboot
+   path gates the watchdog clock on its way down, so BL31 re-opens
+   ``PERI_CRG94`` bit 0 before unlocking, loading and arming the counter.
+-  On this part the counting clock of SP805 is 24 MHz, the same reference the
+   CRG models, so a timeout the kernel watchdog driver reports is the real
+   wall-clock timeout.

@@ -592,6 +592,12 @@ Aspeed platform port
 :|F|: docs/plat/ast2700.rst
 :|F|: plat/aspeed/
 
+HiSilicon Hi3798MV200H platform port
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+:|M|: David Yang <mmyangfl@gmail.com>
+:|F|: docs/plat/hi3798mv200h.rst
+:|F|: plat/hisilicon/hi3798mv200h/
+
 HiSilicon HiKey and HiKey960 platform ports
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 :|M|: Haojian Zhuang <haojian.zhuang@linaro.org>
